@@ -258,7 +258,7 @@ mom_display = mom[["month", "count", "revenue", "Jobs vs Prev.", "Revenue vs Pre
 )
 mom_display["Revenue"] = mom_display["Revenue"].apply(fmt_inr)
 styled = mom_display.style.format({"Jobs vs Prev.": fmt_pct, "Revenue vs Prev.": fmt_pct}) \
-    .applymap(style_change, subset=["Jobs vs Prev.", "Revenue vs Prev."])
+    .map(style_change, subset=["Jobs vs Prev.", "Revenue vs Prev."])
 st.dataframe(styled, use_container_width=True, hide_index=True)
 
 # ----------------------------------------------------------------------------
@@ -273,5 +273,5 @@ yoy_display = yoy.rename(columns={"year": "Year", "count": "Jobs", "revenue": "R
 yoy_display["Year"] = yoy_display["Year"].astype(int)
 yoy_display["Revenue"] = yoy_display["Revenue"].apply(fmt_inr)
 styled_yoy = yoy_display.style.format({"Jobs vs Prev. Yr": fmt_pct, "Revenue vs Prev. Yr": fmt_pct}) \
-    .applymap(style_change, subset=["Jobs vs Prev. Yr", "Revenue vs Prev. Yr"])
+    .map(style_change, subset=["Jobs vs Prev. Yr", "Revenue vs Prev. Yr"])
 st.dataframe(styled_yoy, use_container_width=True, hide_index=True)
