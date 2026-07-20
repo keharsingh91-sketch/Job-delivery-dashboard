@@ -81,6 +81,8 @@ def load_data(path, mtime):
         "year": find_col(cols, "year"),
         "fcRevenue": find_col(cols, "fcrevenue"),
         "actualRevenue": find_col(cols, "actualrevenue"),
+        "footages": find_col(cols, "footages"),
+        "lus": find_col(cols, "lus"),
     }
     missing = [k for k in ("jobNo", "market", "jobType") if not col[k]]
     if missing:
@@ -97,6 +99,8 @@ def load_data(path, mtime):
     out["year"] = pd.to_numeric(df[col["year"]], errors="coerce") if col["year"] else None
     out["fcRevenue"] = pd.to_numeric(df[col["fcRevenue"]], errors="coerce").fillna(0) if col["fcRevenue"] else 0
     out["actualRevenue"] = pd.to_numeric(df[col["actualRevenue"]], errors="coerce").fillna(0) if col["actualRevenue"] else 0
+    out["footages"] = pd.to_numeric(df[col["footages"]], errors="coerce").fillna(0) if col["footages"] else 0
+    out["lus"] = pd.to_numeric(df[col["lus"]], errors="coerce").fillna(0) if col["lus"] else 0
     out = out.dropna(subset=["jobNo"])
     return out
 
@@ -128,6 +132,51 @@ def style_change(val):
     return f"color: {color}; font-weight: 600;"
 
 
+# Final-status pipeline columns for the Month-wise / Year-wise summary tables.
+# (label, matcher) — matcher checks the normalized Final Status text.
+STATUS_COLUMNS = [
+    ("YTS", lambda n: n == "yts"),
+    ("IP", lambda n: n == "ip"),
+    ("QC Feedback", lambda n: "qc" in n),
+    ("Ready for Billing", lambda n: "readyforbilling" in n),
+    ("Hold", lambda n: n == "hold"),
+    ("Invoicing Done", lambda n: "invoicingdone" in n),
+]
+
+
+def build_status_summary(df, group_col, group_label):
+    records = []
+    for key, g in df.groupby(group_col):
+        rec = {
+            group_label: key,
+            "Total Job Count": len(g),
+            "Total Distance (Feet)": g["footages"].sum(),
+            "Total LU's": g["lus"].sum(),
+            "Total FC Revenue (₹)": g["fcRevenue"].sum(),
+        }
+        norm_status = g["finalStatus"].apply(normalize)
+        for label, matcher in STATUS_COLUMNS:
+            mask = norm_status.apply(matcher)
+            if label == "Hold":
+                rec["Hold"] = int(mask.sum())
+            else:
+                rec[f"{label} Job Count"] = int(mask.sum())
+                rec[f"{label} Revenue (₹)"] = g.loc[mask, "actualRevenue"].sum()
+        records.append(rec)
+    return pd.DataFrame(records)
+
+
+def fmt_summary_table(df, group_label):
+    money_cols = [c for c in df.columns if "Revenue" in c]
+    disp = df.copy()
+    for c in money_cols:
+        disp[c] = disp[c].apply(fmt_inr)
+    for c in ["Total Job Count", "Total Distance (Feet)", "Total LU's", "Hold"]:
+        if c in disp.columns:
+            disp[c] = disp[c].apply(lambda v: f"{int(round(v)):,}")
+    return disp
+
+
 # ----------------------------------------------------------------------------
 # LOAD DATA
 # ----------------------------------------------------------------------------
@@ -155,15 +204,53 @@ last_updated = dt.datetime.fromtimestamp(mtime).strftime("%d %b %Y, %I:%M %p")
 st.caption(f"🕒 Last updated: {last_updated}  ·  {len(rows)} rows loaded")
 
 # ----------------------------------------------------------------------------
-# FILTERS
+# FILTERS  (professional checklist-style dropdown, multi-select)
 # ----------------------------------------------------------------------------
 years_available = sorted([int(y) for y in rows["year"].dropna().unique()])
 months_available = [m for m in MONTH_ORDER if m in rows["monthName"].unique()]
 
-with st.container():
-    fc1, fc2 = st.columns(2)
-    sel_years = fc1.multiselect("Year", years_available, default=years_available)
-    sel_months = fc2.multiselect("Month", months_available, default=months_available)
+for y in years_available:
+    st.session_state.setdefault(f"flt_year_{y}", True)
+for m in months_available:
+    st.session_state.setdefault(f"flt_month_{m}", True)
+
+fc1, fc2 = st.columns(2)
+with fc1:
+    n_sel = sum(st.session_state.get(f"flt_year_{y}", True) for y in years_available)
+    with st.popover(f"📅 Year  ({n_sel} selected)", use_container_width=True):
+        b1, b2 = st.columns(2)
+        if b1.button("Select all", key="year_all", use_container_width=True):
+            for y in years_available:
+                st.session_state[f"flt_year_{y}"] = True
+            st.rerun()
+        if b2.button("Clear all", key="year_none", use_container_width=True):
+            for y in years_available:
+                st.session_state[f"flt_year_{y}"] = False
+            st.rerun()
+        st.markdown("---")
+        for y in years_available:
+            st.checkbox(str(y), key=f"flt_year_{y}")
+
+with fc2:
+    n_sel = sum(st.session_state.get(f"flt_month_{m}", True) for m in months_available)
+    with st.popover(f"🗓️ Month  ({n_sel} selected)", use_container_width=True):
+        b1, b2 = st.columns(2)
+        if b1.button("Select all", key="month_all", use_container_width=True):
+            for m in months_available:
+                st.session_state[f"flt_month_{m}"] = True
+            st.rerun()
+        if b2.button("Clear all", key="month_none", use_container_width=True):
+            for m in months_available:
+                st.session_state[f"flt_month_{m}"] = False
+            st.rerun()
+        st.markdown("---")
+        grid = st.columns(3)
+        for i, m in enumerate(months_available):
+            with grid[i % 3]:
+                st.checkbox(m, key=f"flt_month_{m}")
+
+sel_years = [y for y in years_available if st.session_state.get(f"flt_year_{y}", True)]
+sel_months = [m for m in months_available if st.session_state.get(f"flt_month_{m}", True)]
 
 filtered = rows[rows["year"].isin(sel_years) & rows["monthName"].isin(sel_months)]
 
@@ -275,3 +362,27 @@ yoy_display["Revenue"] = yoy_display["Revenue"].apply(fmt_inr)
 styled_yoy = yoy_display.style.format({"Jobs vs Prev. Yr": fmt_pct, "Revenue vs Prev. Yr": fmt_pct}) \
     .map(style_change, subset=["Jobs vs Prev. Yr", "Revenue vs Prev. Yr"])
 st.dataframe(styled_yoy, use_container_width=True, hide_index=True)
+
+st.markdown("---")
+
+# ----------------------------------------------------------------------------
+# MONTH-WISE DETAILED SUMMARY  (full data, ignores filters)
+# ----------------------------------------------------------------------------
+st.subheader("Month-wise Summary  (full data, ignores filters above)")
+month_summary = build_status_summary(rows, "month", "Month")
+order_map = rows.drop_duplicates("month").set_index("month")
+month_summary["_year"] = month_summary["Month"].map(order_map["year"])
+month_summary["_midx"] = month_summary["Month"].map(order_map["monthName"]).apply(
+    lambda m: MONTH_ORDER.index(m) if m in MONTH_ORDER else 99
+)
+month_summary = month_summary.sort_values(["_year", "_midx"]).drop(columns=["_year", "_midx"]).reset_index(drop=True)
+st.dataframe(fmt_summary_table(month_summary, "Month"), use_container_width=True, hide_index=True)
+
+# ----------------------------------------------------------------------------
+# YEAR-WISE DETAILED SUMMARY  (full data, ignores filters)
+# ----------------------------------------------------------------------------
+st.subheader("Year-wise Summary  (full data, ignores filters above)")
+year_summary = build_status_summary(rows, "year", "Year")
+year_summary = year_summary.sort_values("Year").reset_index(drop=True)
+year_summary["Year"] = year_summary["Year"].astype(int)
+st.dataframe(fmt_summary_table(year_summary, "Year"), use_container_width=True, hide_index=True)
