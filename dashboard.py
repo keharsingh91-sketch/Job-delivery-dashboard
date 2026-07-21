@@ -83,6 +83,7 @@ def load_data(path, mtime):
         "actualRevenue": find_col(cols, "actualrevenue"),
         "footages": find_col(cols, "footages"),
         "lus": find_col(cols, "lus"),
+        "qualityScore": find_col(cols, "qualityscore"),
     }
     missing = [k for k in ("jobNo", "market", "jobType") if not col[k]]
     if missing:
@@ -101,6 +102,7 @@ def load_data(path, mtime):
     out["actualRevenue"] = pd.to_numeric(df[col["actualRevenue"]], errors="coerce").fillna(0) if col["actualRevenue"] else 0
     out["footages"] = pd.to_numeric(df[col["footages"]], errors="coerce").fillna(0) if col["footages"] else 0
     out["lus"] = pd.to_numeric(df[col["lus"]], errors="coerce").fillna(0) if col["lus"] else 0
+    out["qualityScore"] = pd.to_numeric(df[col["qualityScore"]], errors="coerce") if col["qualityScore"] else None
     out = out.dropna(subset=["jobNo"])
     return out
 
@@ -132,7 +134,45 @@ def style_change(val):
     return f"color: {color}; font-weight: 600;"
 
 
-# Final-status pipeline columns for the Month-wise / Year-wise summary tables.
+def style_header_zebra(styler):
+    """Navy header + white bold text, zebra-striped rows — used on every table."""
+    styler = styler.set_table_styles(
+        [
+            {"selector": "th", "props": [
+                ("background-color", NAVY), ("color", "white"),
+                ("font-weight", "600"), ("text-align", "center"), ("padding", "8px 10px"),
+            ]},
+            {"selector": "td", "props": [("padding", "6px 10px"), ("font-size", "13px")]},
+        ],
+        overwrite=False,
+    )
+    styler = styler.apply(
+        lambda row: ["background-color: #F4F6FA" if row.name % 2 else "background-color: white" for _ in row],
+        axis=1,
+    )
+    return styler
+
+
+def gradient_style(s, rgb=(46, 95, 163)):
+    """Light-to-dark blue background gradient for a numeric column (no matplotlib needed)."""
+    vals = pd.to_numeric(s, errors="coerce")
+    mn, mx = vals.min(), vals.max()
+    rng = (mx - mn) or 1
+    out = []
+    for v in vals:
+        if pd.isna(v):
+            out.append("")
+            continue
+        pct = (v - mn) / rng
+        r = int(255 - pct * (255 - rgb[0]))
+        g = int(255 - pct * (255 - rgb[1]))
+        b = int(255 - pct * (255 - rgb[2]))
+        txt = "white" if pct > 0.55 else "#1a1a1a"
+        out.append(f"background-color: rgb({r},{g},{b}); color:{txt}; font-weight:600;")
+    return out
+
+
+# Final-status pipeline columns for the Month-wise / Year-wise / Market-wise / Job Type-wise summaries.
 # (label, matcher) — matcher checks the normalized Final Status text.
 STATUS_COLUMNS = [
     ("YTS", lambda n: n == "yts"),
@@ -144,7 +184,7 @@ STATUS_COLUMNS = [
 ]
 
 
-def build_status_summary(df, group_col, group_label):
+def build_status_summary(df, group_col, group_label, include_quality=False):
     records = []
     for key, g in df.groupby(group_col):
         rec = {
@@ -162,19 +202,30 @@ def build_status_summary(df, group_col, group_label):
             else:
                 rec[f"{label} Job Count"] = int(mask.sum())
                 rec[f"{label} Revenue (₹)"] = g.loc[mask, "actualRevenue"].sum()
+        if include_quality:
+            q = g["qualityScore"].dropna() if "qualityScore" in g else pd.Series(dtype=float)
+            rec["Avg Quality Score (%)"] = (q.mean() * 100) if len(q) else None
         records.append(rec)
     return pd.DataFrame(records)
 
 
-def fmt_summary_table(df, group_label):
+def style_summary_table(df, group_label, gradient_col="Total Job Count"):
     money_cols = [c for c in df.columns if "Revenue" in c]
-    disp = df.copy()
-    for c in money_cols:
-        disp[c] = disp[c].apply(fmt_inr)
-    for c in ["Total Job Count", "Total Distance (Feet)", "Total LU's", "Hold"]:
-        if c in disp.columns:
-            disp[c] = disp[c].apply(lambda v: f"{int(round(v)):,}")
-    return disp
+    qual_col = "Avg Quality Score (%)" if "Avg Quality Score (%)" in df.columns else None
+    count_cols = [c for c in df.columns if c not in money_cols and c != group_label and c != qual_col]
+
+    fmt = {c: fmt_inr for c in money_cols}
+    fmt.update({c: (lambda v: f"{int(round(v)):,}") for c in count_cols})
+    if qual_col:
+        fmt[qual_col] = lambda v: "—" if pd.isna(v) else f"{v:.1f}%"
+
+    styler = df.style.format(fmt)
+    styler = style_header_zebra(styler)
+    if gradient_col in df.columns:
+        styler = styler.apply(gradient_style, subset=[gradient_col], axis=0)
+    styler = styler.set_properties(**{"text-align": "right"})
+    styler = styler.set_properties(subset=[group_label], **{"text-align": "left", "font-weight": "700"})
+    return styler
 
 
 # ----------------------------------------------------------------------------
@@ -317,10 +368,10 @@ with c4:
 st.markdown("---")
 
 # ----------------------------------------------------------------------------
-# MONTH-ON-MONTH (always full data, ignores filters)
+# MONTH-ON-MONTH (reflects the filters above)
 # ----------------------------------------------------------------------------
-st.subheader("Month-on-Month Comparison  (full data, ignores filters above)")
-mom = rows.groupby(["year", "monthName", "month"]).agg(
+st.subheader("Month-on-Month Comparison  (reflects the filters above)")
+mom = filtered.groupby(["year", "monthName", "month"]).agg(
     count=("jobNo", "count"), revenue=("actualRevenue", "sum")
 ).reset_index()
 mom["month_idx"] = mom["monthName"].apply(lambda m: MONTH_ORDER.index(m) if m in MONTH_ORDER else 99)
@@ -328,61 +379,102 @@ mom = mom.sort_values(["year", "month_idx"]).reset_index(drop=True)
 mom["Jobs vs Prev."] = [pct_change(mom["count"][i], mom["count"][i - 1]) if i > 0 else None for i in range(len(mom))]
 mom["Revenue vs Prev."] = [pct_change(mom["revenue"][i], mom["revenue"][i - 1]) if i > 0 else None for i in range(len(mom))]
 
-fig = go.Figure()
-fig.add_trace(go.Scatter(x=mom["month"], y=mom["count"], name="Job Count", yaxis="y1",
-                          line=dict(color=BLUE, width=3), mode="lines+markers"))
-fig.add_trace(go.Scatter(x=mom["month"], y=mom["revenue"], name="Actual Revenue", yaxis="y2",
-                          line=dict(color=ORANGE, width=3), mode="lines+markers"))
-fig.update_layout(
-    yaxis=dict(title="Job Count"),
-    yaxis2=dict(title="Revenue (₹)", overlaying="y", side="right"),
-    legend=dict(orientation="h", y=1.15),
-)
-st.plotly_chart(fig, use_container_width=True)
+if mom.empty:
+    st.info("Is filter ke liye koi data nahi hai.")
+else:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=mom["month"], y=mom["count"], name="Job Count", yaxis="y1",
+                              line=dict(color=BLUE, width=3), mode="lines+markers"))
+    fig.add_trace(go.Scatter(x=mom["month"], y=mom["revenue"], name="Actual Revenue", yaxis="y2",
+                              line=dict(color=ORANGE, width=3), mode="lines+markers"))
+    fig.update_layout(
+        yaxis=dict(title="Job Count"),
+        yaxis2=dict(title="Revenue (₹)", overlaying="y", side="right"),
+        legend=dict(orientation="h", y=1.15),
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
-mom_display = mom[["month", "count", "revenue", "Jobs vs Prev.", "Revenue vs Prev."]].rename(
-    columns={"month": "Month", "count": "Jobs", "revenue": "Revenue"}
-)
-mom_display["Revenue"] = mom_display["Revenue"].apply(fmt_inr)
-styled = mom_display.style.format({"Jobs vs Prev.": fmt_pct, "Revenue vs Prev.": fmt_pct}) \
-    .map(style_change, subset=["Jobs vs Prev.", "Revenue vs Prev."])
-st.dataframe(styled, use_container_width=True, hide_index=True)
+    mom_display = mom[["month", "count", "revenue", "Jobs vs Prev.", "Revenue vs Prev."]].rename(
+        columns={"month": "Month", "count": "Jobs", "revenue": "Revenue"}
+    )
+    styler = mom_display.style.format({"Revenue": fmt_inr, "Jobs vs Prev.": fmt_pct, "Revenue vs Prev.": fmt_pct})
+    styler = style_header_zebra(styler)
+    styler = styler.map(style_change, subset=["Jobs vs Prev.", "Revenue vs Prev."])
+    styler = styler.set_properties(**{"text-align": "right"})
+    styler = styler.set_properties(subset=["Month"], **{"text-align": "left", "font-weight": "700"})
+    st.dataframe(styler, use_container_width=True, hide_index=True)
 
 # ----------------------------------------------------------------------------
-# YEAR-ON-YEAR (always full data, ignores filters)
+# YEAR-ON-YEAR (reflects the filters above)
 # ----------------------------------------------------------------------------
-st.subheader("Year-on-Year Comparison  (full data, ignores filters above)")
-yoy = rows.groupby("year").agg(count=("jobNo", "count"), revenue=("actualRevenue", "sum")).reset_index()
+st.subheader("Year-on-Year Comparison  (reflects the filters above)")
+yoy = filtered.groupby("year").agg(count=("jobNo", "count"), revenue=("actualRevenue", "sum")).reset_index()
 yoy = yoy.sort_values("year").reset_index(drop=True)
 yoy["Jobs vs Prev. Yr"] = [pct_change(yoy["count"][i], yoy["count"][i - 1]) if i > 0 else None for i in range(len(yoy))]
 yoy["Revenue vs Prev. Yr"] = [pct_change(yoy["revenue"][i], yoy["revenue"][i - 1]) if i > 0 else None for i in range(len(yoy))]
-yoy_display = yoy.rename(columns={"year": "Year", "count": "Jobs", "revenue": "Revenue"})
-yoy_display["Year"] = yoy_display["Year"].astype(int)
-yoy_display["Revenue"] = yoy_display["Revenue"].apply(fmt_inr)
-styled_yoy = yoy_display.style.format({"Jobs vs Prev. Yr": fmt_pct, "Revenue vs Prev. Yr": fmt_pct}) \
-    .map(style_change, subset=["Jobs vs Prev. Yr", "Revenue vs Prev. Yr"])
-st.dataframe(styled_yoy, use_container_width=True, hide_index=True)
+
+if yoy.empty:
+    st.info("Is filter ke liye koi data nahi hai.")
+else:
+    yoy_display = yoy.rename(columns={"year": "Year", "count": "Jobs", "revenue": "Revenue"})
+    yoy_display["Year"] = yoy_display["Year"].astype(int)
+    styler_yoy = yoy_display.style.format({"Revenue": fmt_inr, "Jobs vs Prev. Yr": fmt_pct, "Revenue vs Prev. Yr": fmt_pct})
+    styler_yoy = style_header_zebra(styler_yoy)
+    styler_yoy = styler_yoy.map(style_change, subset=["Jobs vs Prev. Yr", "Revenue vs Prev. Yr"])
+    styler_yoy = styler_yoy.set_properties(**{"text-align": "right"})
+    styler_yoy = styler_yoy.set_properties(subset=["Year"], **{"text-align": "left", "font-weight": "700"})
+    st.dataframe(styler_yoy, use_container_width=True, hide_index=True)
 
 st.markdown("---")
 
 # ----------------------------------------------------------------------------
-# MONTH-WISE DETAILED SUMMARY  (full data, ignores filters)
+# MONTH-WISE DETAILED SUMMARY  (reflects the filters above)
 # ----------------------------------------------------------------------------
-st.subheader("Month-wise Summary  (full data, ignores filters above)")
-month_summary = build_status_summary(rows, "month", "Month")
-order_map = rows.drop_duplicates("month").set_index("month")
-month_summary["_year"] = month_summary["Month"].map(order_map["year"])
-month_summary["_midx"] = month_summary["Month"].map(order_map["monthName"]).apply(
-    lambda m: MONTH_ORDER.index(m) if m in MONTH_ORDER else 99
-)
-month_summary = month_summary.sort_values(["_year", "_midx"]).drop(columns=["_year", "_midx"]).reset_index(drop=True)
-st.dataframe(fmt_summary_table(month_summary, "Month"), use_container_width=True, hide_index=True)
+st.subheader("Month-wise Summary  (reflects the filters above)")
+month_summary = build_status_summary(filtered, "month", "Month")
+if month_summary.empty:
+    st.info("Is filter ke liye koi data nahi hai.")
+else:
+    order_map = filtered.drop_duplicates("month").set_index("month")
+    month_summary["_year"] = month_summary["Month"].map(order_map["year"])
+    month_summary["_midx"] = month_summary["Month"].map(order_map["monthName"]).apply(
+        lambda m: MONTH_ORDER.index(m) if m in MONTH_ORDER else 99
+    )
+    month_summary = month_summary.sort_values(["_year", "_midx"]).drop(columns=["_year", "_midx"]).reset_index(drop=True)
+    st.dataframe(style_summary_table(month_summary, "Month"), use_container_width=True, hide_index=True)
 
 # ----------------------------------------------------------------------------
-# YEAR-WISE DETAILED SUMMARY  (full data, ignores filters)
+# YEAR-WISE DETAILED SUMMARY  (reflects the filters above)
 # ----------------------------------------------------------------------------
-st.subheader("Year-wise Summary  (full data, ignores filters above)")
-year_summary = build_status_summary(rows, "year", "Year")
-year_summary = year_summary.sort_values("Year").reset_index(drop=True)
-year_summary["Year"] = year_summary["Year"].astype(int)
-st.dataframe(fmt_summary_table(year_summary, "Year"), use_container_width=True, hide_index=True)
+st.subheader("Year-wise Summary  (reflects the filters above)")
+year_summary = build_status_summary(filtered, "year", "Year")
+if year_summary.empty:
+    st.info("Is filter ke liye koi data nahi hai.")
+else:
+    year_summary = year_summary.sort_values("Year").reset_index(drop=True)
+    year_summary["Year"] = year_summary["Year"].astype(int)
+    st.dataframe(style_summary_table(year_summary, "Year"), use_container_width=True, hide_index=True)
+
+st.markdown("---")
+
+# ----------------------------------------------------------------------------
+# MARKET-WISE DETAILED SUMMARY  (reflects the filters above)
+# ----------------------------------------------------------------------------
+st.subheader("Market-wise Summary  (reflects the filters above)")
+market_summary = build_status_summary(filtered, "market", "Market", include_quality=True)
+if market_summary.empty:
+    st.info("Is filter ke liye koi data nahi hai.")
+else:
+    market_summary = market_summary.sort_values("Total Job Count", ascending=False).reset_index(drop=True)
+    st.dataframe(style_summary_table(market_summary, "Market"), use_container_width=True, hide_index=True)
+
+# ----------------------------------------------------------------------------
+# JOB TYPE-WISE DETAILED SUMMARY  (reflects the filters above)
+# ----------------------------------------------------------------------------
+st.subheader("Job Type-wise Summary  (reflects the filters above)")
+jobtype_summary = build_status_summary(filtered, "jobType", "Job Type", include_quality=True)
+if jobtype_summary.empty:
+    st.info("Is filter ke liye koi data nahi hai.")
+else:
+    jobtype_summary = jobtype_summary.sort_values("Total Job Count", ascending=False).reset_index(drop=True)
+    st.dataframe(style_summary_table(jobtype_summary, "Job Type"), use_container_width=True, hide_index=True)
